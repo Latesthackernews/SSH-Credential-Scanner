@@ -20,9 +20,6 @@ paramiko
 rich
 You can install the required dependencies using pip:
 
-bash
-Copy
-1
 pip install paramiko rich
 Installation
 Clone the repository:
@@ -52,7 +49,7 @@ Submit a pull request detailing your changes.
 License
 This project is licensed under the MIT License . Feel free to modify and distribute it as per the terms of the license.
 
-Contact
-For questions or feedback, feel free to reach out:
+---------------------------------------------------------------------------------
+By following the guidelines above, you can effectively use the SSH Credential Scanner for authorized testing and improve the security posture of your network. Happy scanning! 🦁
 
 Ghatrifi Yasser
