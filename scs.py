@@ -2,171 +2,206 @@ import socket
 import paramiko
 import threading
 import sys
-from queue import Queue  # Ensure this import is at the top - for Python 3's queue module
+from queue import Queue
 from rich.console import Console
-from rich.progress import Progress
-import argparse  # For command-line arguments
+from rich.progress import Progress, TextColumn, BarColumn, TimeElapsedColumn
+from rich.table import Table
+from rich import box
+import time
+import logging
+import argparse
 
-# Initialize Rich console
+# Initialize console for rich output
 console = Console()
 
-# Warning message with colors
-console.print("\n[bold red]! WARNING ![/bold red]", justify="center")
-console.print("[red]This script is for educational/authorized use only.[/red]\n", justify="center")
-console.print("Unauthorized port scanning and login attempts may violate laws.\n", style="yellow", justify="center")
-console.print("Use this only on networks you have explicit permission to scan.\n", style="yellow", justify="center")
+# Lion Banner ASCII Art
+LION_BANNER = r"""
+ ██████╗ ██████╗ ███╗   ██╗███████╗██████╗ 
+██╔════╝██╔═══██╗████╗  ██║██╔════╝██╔══██╗
+██║     ██║   ██║██╔██╗ ██║█████╗  ██████╔╝
+██║     ██║   ██║██║╚██╗██║██╔══╝  ██╔══██╗
+╚██████╗╚██████╔╝██║ ╚████║███████╗██║  ██║
+ ╚═════╝ ╚═════╝ ╚═╝  ╚═══╝╚══════╝╚═╝  ╚═╝
+                                           
+    ██████╗ ███████╗███╗   ██╗███████╗    
+    ██╔══██╗██╔════╝████╗  ██║██╔════╝    
+    ██████╔╝█████╗  ██╔██╗ ██║███████╗    
+    ██╔══██╗██╔══╝  ██║╚██╗██║╚════██║    
+    ██║  ██║███████╗██║ ╚████║███████║    
+    ╚═╝  ╚═╝╚══════╝╚═╝  ╚═══╝╚══════╝    
+"""
 
-# --- Global Variables (defined outside any function) ---
-queue = Queue()  # Queue for IP addresses to scan
-MAX_THREADS = 100  # Default number of threads, can be overridden by command-line argument
-TIMEOUT = 1.5      # Default timeout for connection attempts, can be overridden
-DEFAULT_CREDENTIALS = [ # Expanded list of default credentials
+# Warning Banner
+console.print(LION_BANNER, style="bold yellow")
+console.print(
+    "[bold red]WARNING[/bold red]: This script is for educational/authorized use only.\n"
+    "Unauthorized port scanning and login attempts may violate laws.\n"
+    "Use this only on networks you have explicit permission to scan.",
+    justify="center"
+)
+
+# Logging configuration
+logging.basicConfig(level=logging.DEBUG, filename="ssh_scanner.log", filemode="w",
+                    format="%(asctime)s - %(levelname)s - %(message)s")
+
+# Argument Parsing
+parser = argparse.ArgumentParser(description="SSH Credential Scanner")
+parser.add_argument("ip_prefix", help="IP prefix (e.g., 192.168)")
+parser.add_argument("-t", "--threads", type=int, default=100, help="Number of threads (default: 100)")
+parser.add_argument("-to", "--timeout", type=float, default=2.0, help="Connection timeout (default: 2.0 seconds)")
+parser.add_argument("-r", "--retries", type=int, default=3, help="Number of retries for failed connections (default: 3)")
+args = parser.parse_args()
+
+# Configuration
+queue = Queue()
+MAX_THREADS = args.threads
+TIMEOUT = args.timeout
+RETRIES = args.retries
+CREDENTIALS = [
     ('root', 'root'),
     ('admin', 'admin'),
     ('user', 'user'),
     ('guest', 'guest'),
-    ('administrator', 'administrator'),
-    ('root', 'password'),
     ('admin', 'password'),
-    ('user', 'password'),
-    ('guest', 'password'),
-    ('administrator', 'password'),
-    ('root', '123456'),
-    ('admin', '123456'),
-    ('user', '123456'),
-    ('guest', '123456'),
-    ('administrator', '123456'),
-    ('root', 'abcd'),
-    ('admin', 'abcd'),
-    ('root', ''),     # Try empty password for root
-    ('admin', '')    # Try empty password for admin
+    ('root', ''),
+    ('admin', '')
 ]
+FOUND_VULNERABLE = []  # Stores vulnerable hosts
 
-def load_credentials_from_file(filename):
-    """Loads credentials from a file (username:password per line)."""
-    credentials = []
-    try:
-        with open(filename, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and ":" in line:
-                    username, password = line.split(":", 1)
-                    credentials.append((username.strip(), password.strip()))
-        if credentials:
-            console.print(f"[cyan]Loaded [bold]{len(credentials)}[/bold] credentials from [cyan]{filename}[/cyan]")
-        else:
-            console.print(f"[yellow]Warning: No valid credentials found in [cyan]{filename}[/cyan][/yellow]")
-    except FileNotFoundError:
-        console.print(f"[red]Error: Credential file not found: [cyan]{filename}[/cyan][/red]")
-        return None # Indicate file loading failure
-    return credentials
 
-def check_ssh(ip, progress, task_id, credentials_list):
-    """Checks SSH service and attempts login with provided credentials."""
+def is_ssh_service(ip, port=22, timeout=2):
+    """Check if the service running on port 22 is SSH."""
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.settimeout(TIMEOUT)
-            if sock.connect_ex((ip, 22)) == 0: # Check if port 22 is open
-                for username, password in credentials_list:
-                    console.print(f"[dim][*] Testing {ip} - {username}:{password}...[/dim]")
-                    ssh = paramiko.SSHClient()
-                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-                    try:
-                        ssh.connect(ip, username=username, password=password, timeout=TIMEOUT)
-                        console.print(f"[green][+] Successful login: [bold]{ip}[/bold] - {username}:{password}[/green]")
-                        progress.update(task_id, description=f"[green]Scanning {ip}[/green] - [bold green]Success![/bold green]", advance=1)
-                        return  # Exit after successful login
-                    except paramiko.AuthenticationException:
-                        pass # Try next credential on auth failure
-                    except Exception as e:
-                        console.print(f"[yellow][!] SSH Error on {ip} with {username}:{password}: {e}[/yellow]")
-                        pass # Try next credential on other errors
-                    finally:
-                        ssh.close()
-                else: # for...else: no successful login after trying all credentials
-                    progress.update(task_id, advance=1) # Advance progress bar, no success
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, port))
+        banner = sock.recv(1024).decode('utf-8', errors='ignore')
+        sock.close()
+        return "SSH" in banner
+    except Exception:
+        return False
+
+
+def check_ssh(ip, progress, task_id):
+    """Attempt to connect to the SSH service using provided credentials."""
+    def attempt_login(username, password):
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            ssh.connect(ip, username=username, password=password, timeout=TIMEOUT)
+            return True
+        except (paramiko.AuthenticationException, paramiko.SSHException, socket.error):
+            return False
+        finally:
+            ssh.close()
+
+    try:
+        # Check if port 22 is open
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(TIMEOUT)
+            if s.connect_ex((ip, 22)) != 0:
+                return
+
+        # Verify if the service is SSH
+        if not is_ssh_service(ip):
+            console.print(f"[red]\[!][/red] Non-SSH service detected on {ip}")
+            return
+
+        # Test credentials
+        for username, password in CREDENTIALS:
+            for _ in range(RETRIES):
+                if attempt_login(username, password):
+                    FOUND_VULNERABLE.append({
+                        'ip': ip,
+                        'username': username,
+                        'password': password
+                    })
+                    console.print(
+                        f"[green][+] Vulnerable host: {ip} - {username}:{password}[/green]"
+                    )
+                    logging.info(f"Vulnerable host detected: {ip} - {username}:{password}")
+                    break
             else:
-                progress.update(task_id, advance=1) # Advance progress bar, port closed
-    except Exception as overall_error:
-        progress.update(task_id, advance=1) # Advance progress bar on overall error
-        console.print(f"[yellow][!] Overall Check Error on {ip}: {overall_error}[/yellow]")
-        pass
+                continue
+            break
+    except Exception as e:
+        console.print(f"[red]\[!][/red] Error checking {ip}: {e}")
+        logging.error(f"Error checking {ip}: {e}")
+    finally:
+        progress.update(task_id, advance=1)
 
-def worker(progress, task_id, credentials_list):
-    """Worker thread to process IPs from the queue."""
+
+def worker(progress, task_id):
+    """Worker function for multithreading."""
     while True:
         ip = queue.get()
-        check_ssh(ip, progress, task_id, credentials_list) # Call check_ssh with credentials
+        check_ssh(ip, progress, task_id)
         queue.task_done()
 
-def main():
-    """Main function to setup argument parsing and run the scan."""
-    global MAX_THREADS  # Declare MAX_THREADS as global at the VERY beginning of main()
-    global TIMEOUT      # Declare TIMEOUT as global at the VERY beginning of main()
 
-    parser = argparse.ArgumentParser(description="Multithreaded SSH Scanner with enhanced credential options.")
-    parser.add_argument("ip_prefix", help="IP prefix to scan (e.g., 192.168)")
-    parser.add_argument("-c", "--creds-file", type=str, help="Path to custom credentials file (username:password)")
-    parser.add_argument("-th", "--threads", type=int, default=MAX_THREADS, help=f"Number of threads (default: {MAX_THREADS})")
-    parser.add_argument("-t", "--timeout", type=float, default=TIMEOUT, help=f"Timeout for connection attempts (default: {TIMEOUT} seconds)")
-
-    args = parser.parse_args()
-
-    ip_prefix = args.ip_prefix
-    octets = ip_prefix.split('.')
-
-    if len(octets) != 2:
-        console.print("[red]\[!][/red] Invalid IP format. Use [bold]xx.xx[/bold] (e.g., 192.168)")
-        sys.exit()
-
-    try:
-        if not (0 <= int(octets[0]) <= 255 and 0 <= int(octets[1]) <= 255):
-            raise ValueError
-    except ValueError:
-        console.print("[red]\[!][/red] Invalid octet values. Must be 0-255")
-        sys.exit()
-
-    ips = [f"{ip_prefix}.{i}.{j}" for i in range(256) for j in range(256)] # Generate IP range
-    total_ips = len(ips)
-
-    MAX_THREADS = args.threads # Override global MAX_THREADS with command-line value
-    TIMEOUT = args.timeout     # Override global TIMEOUT with command-line value
-
-    custom_credentials = [] # Initialize custom credentials list
-    if args.creds_file: # Load custom credentials if file is specified
-        loaded_creds = load_credentials_from_file(args.creds_file)
-        if loaded_creds: # Check if loading was successful (not None)
-            custom_credentials.extend(loaded_creds)
-
-    effective_credentials = custom_credentials + DEFAULT_CREDENTIALS # Combine credentials (custom first)
-
-    console.print(f"\n[bold]Starting Enhanced SSH Scanner[/bold]")
-    console.print(f"• Target Range: [cyan]{ip_prefix}.0.0/16[/cyan]")
-    console.print(f"• Total IPs: [cyan]{total_ips}[/cyan]")
-    console.print(f"• Threads: [cyan]{MAX_THREADS}[/cyan]")
-    console.print(f"• Timeout: [cyan]{TIMEOUT}s[/cyan]")
-    console.print(f"• Credentials sets: [cyan]{len(effective_credentials)}[/cyan]\n")
-
-    if args.creds_file:
-        console.print(f"[cyan]Using credentials from file: [bold]{args.creds_file}[/bold][/cyan]")
+def show_results():
+    """Display scan results in a table format."""
+    if FOUND_VULNERABLE:
+        vuln_table = Table(
+            box=box.ROUNDED,
+            title="[bold red]Vulnerable Hosts[/bold red]",
+            show_header=True,
+            header_style="bold white on red"
+        )
+        vuln_table.add_column("IP Address", style="cyan")
+        vuln_table.add_column("Username", style="yellow")
+        vuln_table.add_column("Password", style="yellow")
+        for host in FOUND_VULNERABLE:
+            vuln_table.add_row(
+                host['ip'],
+                host['username'],
+                host['password']
+            )
+        console.print("\n")
+        console.print(vuln_table)
     else:
-        console.print(f"[cyan]Using [bold]default[/bold] credentials.[/cyan]")
-    console.print("\n[bold]Scan in progress...[/bold]\n")
+        console.print("\n[bold yellow]No vulnerable hosts found.[/bold yellow]")
 
-    with Progress() as progress: # Progress bar context
-        task_id = progress.add_task("[cyan]Scanning SSH...", total=total_ips, start=False)
-        progress.start_task(task_id)
 
-        for _ in range(MAX_THREADS): # Start worker threads
-            threading.Thread(target=worker, args=(progress, task_id, effective_credentials), daemon=True).start()
+def main():
+    try:
+        ip_prefix = args.ip_prefix
+        octets = ip_prefix.split('.')
 
-        for ip in ips: # Add IPs to the queue
-            queue.put(ip)
-            progress.update(task_id, description=f"[cyan]Scanning {ip}[/cyan]", advance=0)
+        if len(octets) != 2 or not all(o.isdigit() and 0 <= int(o) <= 255 for o in octets):
+            console.print("[red]\[!] Invalid IP format. Use [bold]xx.xx[/bold] (e.g., 192.168)[/red]")
+            sys.exit(1)
 
-        queue.join() # Wait for queue to be empty
-        progress.stop_task(task_id)
-        console.print("\n[bold green]Scan completed.[/bold green]")
+        ips = [f"{ip_prefix}.{i}.{j}" for i in range(256) for j in range(256)]
+
+        console.print(f"\n[bold]Scanning {len(ips)} IPs in range {ip_prefix}.x.x[/bold]")
+        console.print(f"Testing credentials: [yellow]{len(CREDENTIALS)} combinations[/yellow]")
+        console.print(f"Threads: [cyan]{MAX_THREADS}[/cyan], Timeout: [cyan]{TIMEOUT}s[/cyan], Retries: [cyan]{RETRIES}[/cyan]\n")
+
+        # Start workers
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            transient=True
+        ) as progress:
+            task_id = progress.add_task("[cyan]Scanning...", total=len(ips))
+
+            for _ in range(MAX_THREADS):
+                threading.Thread(target=worker, args=(progress, task_id), daemon=True).start()
+
+            for ip in ips:
+                queue.put(ip)
+
+            queue.join()
+
+        show_results()
+    except KeyboardInterrupt:
+        console.print("\n[red]\[!] Scan interrupted![/red]")
+        show_results()
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
